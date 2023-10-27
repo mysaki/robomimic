@@ -40,7 +40,8 @@ import robomimic.utils.file_utils as FileUtils
 from robomimic.config import config_factory
 from robomimic.algo import algo_factory, RolloutPolicy
 from robomimic.utils.log_utils import PrintLogger, DataLogger, flush_warnings
-
+from robomimic.data.dataset import (make_dataset, get_obs_normalization_stats_rlds, 
+    get_action_normalization_stats_rlds)
 
 def train(config, device):
     """
@@ -68,27 +69,40 @@ def train(config, device):
     # read config to set up metadata for observation modalities (e.g. detecting rgb observations)
     ObsUtils.initialize_obs_utils_with_config(config)
 
-    # make sure the dataset exists
-    eval_dataset_cfg = config.train.data[0]
-    dataset_path = os.path.expanduser(eval_dataset_cfg["path"])
+    # Load the datasets
+    train_builder, train_loader, normalization_metadata = make_dataset(
+        config,
+        train=True,
+        shuffle=True
+    )
     ds_format = config.train.data_format
-    if not os.path.exists(dataset_path):
-        raise Exception("Dataset at provided path {} not found!".format(dataset_path))
+    assert ds_format == 'rlds'
+
+    if config.experiment.validate:
+        # cap num workers for validation dataset at 1
+        num_workers = min(config.train.num_data_workers, 1)
+        valid_builder, valid_loader, _ = make_dataset(
+            config,
+            train=True,
+            shuffle=True,
+            normalization_metadata=normalization_metadata
+        )
+
+    else:
+        valid_loader = None
+
 
     # load basic metadata from training file
     print("\n============= Loaded Environment Metadata =============")
-    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=dataset_path, ds_format=ds_format)
-
+    env_meta = FileUtils.get_env_metadata_from_dataset_rlds(train_builder)
     # update env meta if applicable
     from robomimic.utils.script_utils import deep_update
     deep_update(env_meta, config.experiment.env_meta_update_dict)
 
-    shape_meta = FileUtils.get_shape_metadata_from_dataset(
-        dataset_path=dataset_path,
+    shape_meta = FileUtils.get_shape_metadata_from_dataset_rlds(
+        train_builder,
         action_keys=config.train.action_keys,
         all_obs_keys=config.all_obs_keys,
-        ds_format=ds_format,
-        verbose=True
     )
 
     if config.experiment.env is not None:
@@ -150,50 +164,20 @@ def train(config, device):
     print(model)  # print model summary
     print("")
 
-    # load training data
-    trainset, validset = TrainUtils.load_data_for_training(
-        config, obs_keys=shape_meta["all_obs_keys"])
-    train_sampler = trainset.get_dataset_sampler()
-    print("\n============= Training Dataset =============")
-    print(trainset)
-    print("")
-    if validset is not None:
-        print("\n============= Validation Dataset =============")
-        print(validset)
-        print("")
 
     # maybe retreve statistics for normalizing observations
     obs_normalization_stats = None
     if config.train.hdf5_normalize_obs:
-        obs_normalization_stats = trainset.get_obs_normalization_stats()
+        obs_normalization_stats = get_obs_normalization_stats_rlds(
+            normalization_metadata,
+            config
+        )
 
     # maybe retreve statistics for normalizing actions
-    action_normalization_stats = trainset.get_action_normalization_stats()
-
-    # initialize data loaders
-    train_loader = DataLoader(
-        dataset=trainset,
-        sampler=train_sampler,
-        batch_size=config.train.batch_size,
-        shuffle=(train_sampler is None),
-        num_workers=config.train.num_data_workers,
-        drop_last=True
+    action_normalization_stats = get_action_normalization_stats_rlds(
+            normalization_metadata,
+            config
     )
-
-    if config.experiment.validate:
-        # cap num workers for validation dataset at 1
-        num_workers = min(config.train.num_data_workers, 1)
-        valid_sampler = validset.get_dataset_sampler()
-        valid_loader = DataLoader(
-            dataset=validset,
-            sampler=valid_sampler,
-            batch_size=config.train.batch_size,
-            shuffle=(valid_sampler is None),
-            num_workers=num_workers,
-            drop_last=True
-        )
-    else:
-        valid_loader = None
 
     # print all warnings before training begins
     print("*" * 50)
@@ -218,7 +202,7 @@ def train(config, device):
             data_loader=train_loader,
             epoch=epoch,
             num_steps=train_num_steps,
-            obs_normalization_stats=obs_normalization_stats,
+            obs_normalization_stats=obs_normalization_stats
         )
         model.on_epoch_end(epoch)
 
